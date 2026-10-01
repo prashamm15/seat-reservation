@@ -1,0 +1,35 @@
+databases:
+  - name: paytm-seat-db
+    plan: free
+    postgresMajorVersion: "16"
+
+services:
+  - type: web
+    name: paytm-seat-reservation
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /readyz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "8080"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: paytm-seat-db
+          property: connectionString
+      - key: DATABASE_SSL
+        value: "true"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_TOKEN
+        generateValue: true
+      - key: PG_POOL_MAX
+        value: "20"
+      - key: HOLD_TTL_SECONDS
+        value: "120"
+      - key: DEFAULT_PER_USER_LIMIT
+        value: "4"
+      - key: LOG_LEVEL
+        value: info
