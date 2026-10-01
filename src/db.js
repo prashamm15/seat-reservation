@@ -2,7 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { Pool } = require('pg');
+const { Pool, Client } = require('pg');
 
 // A fixed, arbitrary key used for the migration advisory lock so that concurrent
 // app instances booting at once never race to apply the schema twice.
@@ -32,6 +32,30 @@ function createPool({ databaseUrl, max, ssl, logger }) {
   });
 
   return pool;
+}
+
+/**
+ * DATABASE_SSL=true means "use TLS if the server offers it". Managed hosts differ:
+ * external endpoints require TLS, some private-network endpoints don't speak it.
+ * Probe once at boot: only an explicit "server does not support SSL" downgrades to
+ * plaintext. Any other failure (e.g. DB not up yet) keeps TLS on and lets the
+ * migration loop keep retrying — readiness stays 503 meanwhile.
+ */
+async function resolveSsl(databaseUrl, wantSsl, logger) {
+  if (!wantSsl) return false;
+  const probe = new Client({ connectionString: databaseUrl, ssl: { rejectUnauthorized: false }, connectionTimeoutMillis: 5000 });
+  try {
+    await probe.connect();
+    return true;
+  } catch (err) {
+    if (/does not support SSL/i.test(String(err && err.message))) {
+      if (logger) logger.warn('database does not support SSL; using a plaintext connection');
+      return false;
+    }
+    return true;
+  } finally {
+    await probe.end().catch(() => {});
+  }
 }
 
 async function runMigrations(pool) {
@@ -84,4 +108,4 @@ function startMigrationLoop(pool, state, logger) {
   };
 }
 
-module.exports = { createPool, runMigrations, startMigrationLoop };
+module.exports = { createPool, resolveSsl, runMigrations, startMigrationLoop };

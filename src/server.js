@@ -2,7 +2,7 @@
 
 const config = require('./config');
 const { buildApp } = require('./app');
-const { createPool, startMigrationLoop } = require('./db');
+const { createPool, resolveSsl, startMigrationLoop } = require('./db');
 const { createSweeperLoop } = require('./lib/sweeper');
 const metrics = require('./metrics');
 
@@ -14,7 +14,7 @@ async function startServer() {
   const pool = createPool({
     databaseUrl: config.databaseUrl,
     max: config.pgPoolMax,
-    ssl: config.databaseSsl,
+    ssl: await resolveSsl(config.databaseUrl, config.databaseSsl),
   });
 
   const state = { migrated: false };
@@ -38,14 +38,25 @@ async function startServer() {
 }
 
 if (require.main === module) {
-  startServer().catch((err) => {
+  const started = startServer().catch((err) => {
     // eslint-disable-next-line no-console
     console.error('failed to start server', err);
     process.exit(1);
   });
 
-  process.on('SIGTERM', () => process.exit(0));
-  process.on('SIGINT', () => process.exit(0));
+  // Graceful shutdown (e.g. a redeploy): stop accepting connections, let in-flight
+  // reservations finish their transactions, close the pool, then exit.
+  let stopping = false;
+  const shutdown = (signal) => {
+    if (stopping) return;
+    stopping = true;
+    setTimeout(() => process.exit(1), 10000).unref();
+    started
+      .then((srv) => srv && (srv.app.log.info({ signal }, 'shutting down'), srv.close()))
+      .then(() => process.exit(0), () => process.exit(1));
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 module.exports = { startServer };
