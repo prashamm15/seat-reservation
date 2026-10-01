@@ -4,31 +4,39 @@ const pino = require('pino');
 const config = require('./config');
 
 const MAX_LINES = 5000;
-const ringBuffer = [];
+// Fixed-size circular buffer: O(1) per line (Array#shift on a 5000-entry array is O(n)).
+const ringBuffer = new Array(MAX_LINES);
+let ringNext = 0;
+let ringCount = 0;
 
 const ringStream = {
   write(chunk) {
-    const line = chunk.toString();
-    ringBuffer.push(line);
-    if (ringBuffer.length > MAX_LINES) {
-      ringBuffer.shift();
-    }
+    ringBuffer[ringNext] = chunk.toString();
+    ringNext = (ringNext + 1) % MAX_LINES;
+    if (ringCount < MAX_LINES) ringCount++;
   },
 };
 
-const streams = [{ stream: process.stdout }, { stream: ringStream }];
+// Async stdout: sonic-boom coalesces lines written while a previous write is in flight
+// into one syscall, instead of one blocking write per line. flushLogs() on shutdown.
+const stdoutDest = pino.destination({ dest: 1, sync: false });
+const streams = [{ stream: stdoutDest }, { stream: ringStream }];
+
+function flushLogs() {
+  try {
+    stdoutDest.flushSync();
+  } catch (e) {
+    // nothing buffered / stream not ready - fine
+  }
+}
 
 const loggerInstance = pino(
   {
     level: config.logLevel,
     redact: {
-      paths: [
-        'req.headers.authorization',
-        'headers.authorization',
-        'authorization',
-        '*.authorization',
-        '*.Authorization',
-      ],
+      // Request objects/headers are never logged; this is a backstop. Exact paths
+      // only - wildcard redaction is evaluated on every log call.
+      paths: ['req.headers.authorization', 'headers.authorization', 'authorization'],
       censor: '[REDACTED]',
     },
   },
@@ -39,8 +47,8 @@ function getLogs({ requestId, limit, level } = {}) {
   const max = Math.min(Math.max(parseInt(limit, 10) || 200, 1), MAX_LINES);
   const out = [];
   // iterate from newest to oldest
-  for (let i = ringBuffer.length - 1; i >= 0 && out.length < max; i--) {
-    const raw = ringBuffer[i];
+  for (let n = 0; n < ringCount && out.length < max; n++) {
+    const raw = ringBuffer[(ringNext - 1 - n + MAX_LINES) % MAX_LINES];
     let parsed;
     try {
       parsed = JSON.parse(raw);
@@ -59,4 +67,4 @@ function levelNameToNumber(name) {
   return map[String(name).toLowerCase()] ?? name;
 }
 
-module.exports = { loggerInstance, getLogs };
+module.exports = { loggerInstance, getLogs, flushLogs };

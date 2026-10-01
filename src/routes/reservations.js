@@ -33,6 +33,25 @@ async function findReservationByIdemKey(pool, userId, idempotencyKey) {
   return res.rowCount ? res.rows[0] : null;
 }
 
+// Shows are immutable once created (no update endpoint), so the fields the reserve
+// path needs (price, per-user limit, hold TTL) are cached in memory: one fewer DB
+// round trip per request. Only hits are cached — a missing show is re-checked.
+const SHOW_CACHE_MAX = 1000;
+const showCache = new Map();
+
+async function getShow(pool, showId) {
+  const cached = showCache.get(showId);
+  if (cached) return cached;
+  const res = await pool.query(
+    'SELECT id, price_paise, per_user_limit, hold_ttl_seconds FROM shows WHERE id = $1',
+    [showId]
+  );
+  if (res.rowCount === 0) return null;
+  if (showCache.size >= SHOW_CACHE_MAX) showCache.clear();
+  showCache.set(showId, res.rows[0]);
+  return res.rows[0];
+}
+
 function declinedMetric(reason) {
   metrics.reservationsDeclinedTotal.inc({ reason });
 }
@@ -77,47 +96,50 @@ async function reservationRoutes(app, { config }) {
     const hold = body.hold === true;
     const requestHash = canonicalRequestHash({ showId, seats: sortedSeats, hold });
 
-    const showRes = await app.pool.query('SELECT * FROM shows WHERE id = $1', [showId]);
-    if (showRes.rowCount === 0) {
+    const show = await getShow(app.pool, showId);
+    if (!show) {
       throw new AppError(404, 'not_found', 'show not found');
     }
-    const show = showRes.rows[0];
 
+    // One concise log line per request: the decision is attached to the request and
+    // emitted with the access line in the onResponse hook (src/app.js).
     const logDecision = (outcome, reason, extra) => {
-      req.log.info(
-        Object.assign(
-          { user_id: userId, show_id: showId, outcome, reason, seats: sortedSeats },
-          extra
-        ),
-        'reservation_decision'
-      );
+      req.decision = Object.assign({ user_id: userId, show_id: showId, outcome, reason, seats: sortedSeats }, extra);
     };
 
-    // --- (b) fast-path pre-check: seat availability FIRST, then idempotency lookup. ---
-    // This ordering matters: a retry of a request whose original already committed
-    // concurrently must always be recognised as a replay, never as seat_unavailable.
+    // --- (b) fast path: seat availability AND the idempotency key, in ONE statement. ---
+    // Both reads come from the same snapshot, and a reservation commits atomically with
+    // its seats. So if the seats look taken because *this key's* original request won,
+    // that reservation is visible in the very same snapshot and we replay it — a retry is
+    // never misreported as seat_unavailable. If the key already exists we can answer
+    // from it directly (replay or key-reuse 409) without opening a transaction at all.
+    // Nothing here decides a positive outcome: all-free only means "go try the txn".
     const preCheck = await app.pool.query(
-      `SELECT label, (status = 'available' OR (status = 'held' AND held_until <= now())) AS free
-       FROM seats
-       WHERE show_id = $1 AND label = ANY($2)`,
-      [showId, sortedSeats]
+      `SELECT req.label,
+              s.label IS NOT NULL AS known,
+              (s.status = 'available' OR (s.status = 'held' AND s.held_until <= now())) AS free,
+              (SELECT row_to_json(r) FROM (
+                 SELECT id, show_id, user_id, seats, amount_paise, status, expires_at, created_at, updated_at, request_hash
+                 FROM reservations WHERE user_id = $3 AND idempotency_key = $4) r) AS existing
+       FROM unnest($2::text[]) AS req(label)
+       LEFT JOIN seats s ON s.show_id = $1 AND s.label = req.label`,
+      [showId, sortedSeats, userId, idempotencyKey]
     );
-    const knownLabels = new Map(preCheck.rows.map((r) => [r.label, r.free]));
-    const unknownLabels = sortedSeats.filter((s) => !knownLabels.has(s));
-    const takenLabels = sortedSeats.filter((s) => knownLabels.has(s) && !knownLabels.get(s));
+    const existingKey = preCheck.rows.length ? preCheck.rows[0].existing : null;
+    if (existingKey) {
+      return replayResponse(existingKey, requestHash, reply, logDecision);
+    }
+    const unknownLabels = preCheck.rows.filter((r) => !r.known).map((r) => r.label);
+    const takenLabels = preCheck.rows.filter((r) => r.known && !r.free).map((r) => r.label);
 
-    if (unknownLabels.length > 0 || takenLabels.length > 0) {
-      const existing = await findReservationByIdemKey(app.pool, userId, idempotencyKey);
-      if (existing) {
-        return replayResponse(existing, requestHash, reply, logDecision);
-      }
-      // Distinguish "doesn't exist" (400) from "exists but taken" (409) - a nonexistent
-      // seat is a client mistake, not contention, and deserves a different status code.
-      if (unknownLabels.length > 0) {
-        declinedMetric('unknown_seat');
-        logDecision('declined', 'unknown_seat', { unknown: unknownLabels });
-        return reply.code(400).send({ error: 'unknown_seat', unknown: unknownLabels });
-      }
+    // Distinguish "doesn't exist" (400) from "exists but taken" (409) - a nonexistent
+    // seat is a client mistake, not contention, and deserves a different status code.
+    if (unknownLabels.length > 0) {
+      declinedMetric('unknown_seat');
+      logDecision('declined', 'unknown_seat', { unknown: unknownLabels });
+      return reply.code(400).send({ error: 'unknown_seat', unknown: unknownLabels });
+    }
+    if (takenLabels.length > 0) {
       declinedMetric('seat_taken');
       logDecision('declined', 'seat_taken', { unavailable: takenLabels });
       return reply.code(409).send({ error: 'seat_unavailable', unavailable: takenLabels });
@@ -388,10 +410,7 @@ async function reservationRoutes(app, { config }) {
     }
 
     metrics.reservationsCancelledTotal.inc();
-    req.log.info(
-      { user_id: userId, reservation_id: id, outcome: 'cancelled' },
-      'reservation_decision'
-    );
+    req.decision = { user_id: userId, reservation_id: id, outcome: 'cancelled' };
     return serializeReservation(outcome.reservation);
   });
 
@@ -485,10 +504,7 @@ async function reservationRoutes(app, { config }) {
 
     metrics.holdsConfirmedTotal.inc();
     metrics.seatsConfirmedTotal.inc(outcome.reservation.seats.length);
-    req.log.info(
-      { user_id: userId, reservation_id: id, outcome: 'confirmed' },
-      'reservation_decision'
-    );
+    req.decision = { user_id: userId, reservation_id: id, outcome: 'confirmed' };
     return serializeReservation(outcome.reservation);
   });
 }

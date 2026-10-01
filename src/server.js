@@ -5,6 +5,7 @@ const { buildApp } = require('./app');
 const { createPool, resolveSsl, startMigrationLoop } = require('./db');
 const { createSweeperLoop } = require('./lib/sweeper');
 const metrics = require('./metrics');
+const { flushLogs } = require('./logger');
 
 async function startServer() {
   if (config.isProd && !config.databaseUrl) {
@@ -53,7 +54,7 @@ if (require.main === module) {
     setTimeout(() => process.exit(1), 10000).unref();
     started
       .then((srv) => srv && (srv.app.log.info({ signal }, 'shutting down'), srv.close()))
-      .then(() => process.exit(0), () => process.exit(1));
+      .then(() => { flushLogs(); process.exit(0); }, () => { flushLogs(); process.exit(1); });
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));

@@ -37,6 +37,7 @@ function buildApp({ pool, state }) {
   });
 
   app.decorate('pool', pool);
+  app.decorateRequest('decision', null);
   app.decorate('appState', state);
 
   app.addHook('onSend', async (req, reply, payload) => {
@@ -53,15 +54,11 @@ function buildApp({ pool, state }) {
     if (reply.statusCode >= 500) {
       metrics.http5xxTotal.inc();
     }
-    req.log.info(
-      {
-        method: req.method,
-        route,
-        status: reply.statusCode,
-        ms: Math.round(seconds * 1000),
-      },
-      'access'
-    );
+    // ONE structured line per request: access fields plus, for reserve/cancel/confirm,
+    // the domain decision (outcome, reason, seats, reservation_id).
+    const line = { method: req.method, route, status: reply.statusCode, ms: Math.round(seconds * 1000) };
+    if (req.decision) Object.assign(line, req.decision);
+    req.log.info(line, req.decision ? 'reservation_decision' : 'access');
   });
 
   app.setErrorHandler((err, req, reply) => {
