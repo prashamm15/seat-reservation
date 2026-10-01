@@ -22,6 +22,28 @@ async function healthRoutes(app, { pool, state }) {
     await probePool.end().catch(() => {});
   });
 
+  // A landing response for the bare live URL, so it doesn't read as a 404.
+  app.get('/', async () => {
+    return {
+      service: 'seat-reservation',
+      status: 'ok',
+      repo: 'https://github.com/prashamm15/seat-reservation',
+      endpoints: {
+        'POST /auth/token': 'demo identity provider: {"user_id"} -> bearer token',
+        'POST /shows': 'admin: create a show',
+        'GET /shows/:id': 'per-seat status, counts, invariant + reconciliation',
+        'POST /shows/:id/reserve': 'reserve seats (all-or-nothing, idempotent)',
+        'POST /reservations/:id/cancel': 'owner only',
+        'POST /reservations/:id/confirm': 'owner only, converts a hold',
+        'GET /reservations/:id': 'owner only',
+        'GET /healthz': 'liveness',
+        'GET /readyz': 'readiness (checks the database, fails closed)',
+        'GET /metrics': 'Prometheus metrics',
+        'GET /logs': 'recent structured logs (?request_id=&limit=&level=)',
+      },
+    };
+  });
+
   app.get('/healthz', async () => {
     return { status: 'ok' };
   });

@@ -67,3 +67,14 @@ test('readiness stays 200 while every request-pool connection is busy', async (t
   const r = await jsonFetch(`${server.baseUrl}/readyz`);
   assert.equal(r.status, 200, JSON.stringify(r.body));
 });
+
+test('the bare live URL answers 200 with an endpoint index, not a 404', async (t) => {
+  const server = await startTestApp('postgresql://nouser:nopass@127.0.0.1:1/nodb', { skipMigrate: true });
+  t.after(async () => {
+    await server.close();
+  });
+  const r = await jsonFetch(`${server.baseUrl}/`);
+  assert.equal(r.status, 200);
+  assert.equal(r.body.service, 'seat-reservation');
+  assert.ok(r.body.endpoints['POST /shows/:id/reserve']);
+});
