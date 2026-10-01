@@ -74,12 +74,11 @@ one exists, regardless of why the seats look unavailable.
 
 The pre-check also distinguishes a seat that doesn't exist at all from one
 that exists but is taken (by fetching every requested label's row,
-regardless of status, rather than just counting free ones) - the spec
-defines separate `400 unknown_seat` and `409 seat_unavailable` responses for
-these, and folding them into one free-count check would have made
-`unknown_seat` unreachable in the normal flow, since a nonexistent seat can
-never count as free. This is documented as a deliberate interpretation in
-**Deviations** below.
+regardless of status, rather than just counting free ones) - the API
+defines separate `400 unknown_seat` (client mistake) and `409
+seat_unavailable` (lost a race) responses, and folding them into one
+free-count check would have made `unknown_seat` unreachable in the normal
+flow, since a nonexistent seat can never count as free.
 
 ## Idempotency
 
@@ -171,8 +170,11 @@ what `GET /shows/:id` reports) plus Node's default process metrics.
 **What pages at 2am**, roughly in priority order:
 1. **Any 5xx at all** (`http_5xx_total` moving, or the burst script's own
    assertion failing) - this system is specified to never produce one; a
-   single occurrence means either a real bug or the infra-error fallback in
-   `src/lib/retry.js` is masking something that needs attention.
+   single occurrence is a real bug. (Alert on
+   `http_requests_total{status=~"5.."}` excluding `/readyz`, whose 503 during
+   boot/DB outage is the intended fail-closed signal, covered by item 3.)
+   Close behind it: **`reservations_declined_total{reason="overloaded"}`
+   moving** - the service is shedding load (429) rather than deciding.
 2. **`invariant_ok: false` or `reconciliation.ok: false`** on any show - this
    would mean the core guarantee (never double-sell) has actually been
    violated, or the two independent ways of counting "how many seats are
@@ -201,72 +203,76 @@ filtered by.
 
 ## Load characteristics & limits on free tier
 
-Measured locally (one laptop, embedded Postgres, single Fastify process):
-a 20,000-request burst at 1,000-way concurrency against a fresh 2,000-seat
-show completes with **0 5xx, 0 network errors**, p50/p95/p99/max latency
-around 300ms/1.2s/1.3s/1.4s (see the burst output in the final report for
-the exact run). The first attempt at this scale *did* produce 5xx (pool
-connections parking for up to a 10s `lock_timeout` under hot-row
-contention, then the pool itself timing out handing out connections) -
-fixed by dropping `lock_timeout` to 3s so losing transactions fail fast and
-free their connection for the next attempt, plus a defensive fallback that
-converts any retry-exhausted lock/connection-timeout error into a 409
-decline rather than ever surfacing as 500 (see the dedicated commit for the
-full story). On a free hosting tier (Render free web service: shared/0.1
-CPU typically, free Postgres with a low connection cap, and a cold start
-after idle) the same burst would need a materially lower `--concurrency`
-and `--requests` to stay within the same latency envelope - `PG_POOL_MAX`
-in particular should never be set higher than the free Postgres plan's own
-`max_connections` allows headroom for (migrations, the sweeper, and any
-manual `psql` all need a slot too).
+Measured locally (one laptop, embedded Postgres, single Node process,
+`PG_POOL_MAX=20`): `./burst.sh` with 20,000 stampede requests at 1,000-way
+concurrency, plus a 5 x 500-user hot-seat storm, against a fresh 2,000-seat
+show - **0 5xx, 0 network errors, 0 load-shed (429)**, exactly one winner per
+hot seat, p50/p95/p99/max ~300ms/1.2s/1.35s/1.4s, and every Prometheus
+counter equal to the client-observed outcome counts.
+
+Free hosting tiers (Render free: ~0.1 shared CPU, free Postgres with a low
+connection cap, spin-down after idle) are much slower; the design is the
+same but latency rises, so run the burst with a lower `--concurrency` there.
+A cold start takes ~1 minute; the burst script waits up to 90s for
+`/readyz` before starting. Keep `PG_POOL_MAX` comfortably under the
+database's `max_connections` (migrations and the sweeper need slots too).
+
+**Overload behaviour.** A request that cannot get a pool connection (60s) or
+a row lock (`lock_timeout` 3s, after 3 retries) answers **429 `busy`** with
+`Retry-After: 1`. Its transaction rolled back, so nothing was written and
+retrying the same idempotency key is safe by construction. It is
+deliberately *not* reported as `seat_unavailable`: the seat may still be
+free, and `seat_taken` must stay a truthful signal. Counted as
+`reservations_declined_total{reason="overloaded"}`; the burst client
+retries 429s with the same key. `test/overload.test.js` forces this path by
+holding a seat's row lock from outside and asserts 429, no rows written,
+then a successful retry.
+
+## Bugs found by load-testing (and how they were fixed)
+
+Unit tests passed while all of these were present - only the full-scale
+burst exposed them.
+
+1. **Connection-pool self-deadlock.** When `INSERT ... ON CONFLICT DO
+   NOTHING` hit an existing idempotency key, the replay branch fetched the
+   original reservation through `pool.query` - a *second* connection -
+   while still holding the transaction's connection. Under a burst with
+   many same-key retries, all 20 connections were held by requests each
+   waiting for a 21st, and everything froze until the 60s pool timeout.
+   First full-scale run: ~1,500 5xx. Fix: reuse the held connection.
+   Regression test: 60 concurrent same-key requests on a 3-connection pool
+   must finish in <10s with one 201 and 59 replays (it stalls ~68s on the
+   old code).
+2. **Misreported overload.** An early mitigation for (1) converted lock/pool
+   timeouts into `409 seat_unavailable`. That hid the deadlock instead of
+   fixing it and made `seat_taken` lie. Replaced by the honest 429 above
+   once the root cause was fixed.
+3. **App clock vs DB clock.** Hold expiry was compared with `Date.now()` in
+   Node but enforced with `now()` in SQL. Safe but inconsistent under clock
+   skew; every "is this hold expired?" decision now happens in Postgres.
+4. **`npm run dev` only worked once** - it ran `initdb` on every start,
+   which fails on an existing data directory.
+5. **`http_5xx_total` double-counted** real 500s (error handler and
+   response hook both incremented it).
 
 ## AI usage
 
-This service was designed with Claude Opus 5.5 (architecture/atomicity
-spec, code review, test verification) and implemented with Claude Sonnet
-via Claude Code, at the candidate's direction.
+AI was used heavily, through Claude Code:
 
-> TODO (candidate): describe in your own words what you directed, what you
-> changed or rejected, and what you verified yourself.
+- **Claude Opus 5.5** wrote the design brief the implementation followed:
+  the data model, the exact lock order (idempotency unique key -> per-user
+  advisory lock -> seat rows `ORDER BY label FOR UPDATE` -> guarded
+  `UPDATE`), lazy hold expiry with the `reservation_id` guard, the metric
+  and endpoint list, and the burst-script phases.
+- **Claude Sonnet 5** implemented that brief, wrote the test suite and the
+  burst script, and ran them.
+- **Claude Opus 5.5** then reviewed the code and re-ran the tests and the
+  20k burst independently. That review found bugs 1-5 above, including the
+  pool deadlock that the implementation pass had masked rather than fixed.
 
-## Deviations from the spec, and why
-
-- **The fast-path pre-check (step b) distinguishes "seat doesn't exist" from
-  "seat exists but is taken"** by fetching every requested label's row
-  (existence + effective-free status) instead of only counting free rows.
-  The spec's literal wording ("one query counting requested seats that are
-  effectively free... if fewer than n are free... 409 seat_unavailable")
-  would make the transaction's own `400 unknown_seat` branch (step f)
-  unreachable in practice, since a nonexistent seat can never contribute to
-  a "free" count and the fast path would always decline first. Classifying
-  unknown seats as `400` at the fast-path stage instead gives a more useful
-  answer (the client made a mistake vs. the client lost a race) and
-  actually exercises the error code the spec defines for it. This was
-  caught by a test expecting `400 unknown_seat` for a wholly-unknown seat
-  label and is the one place the implementation reads the algorithm's
-  *intent* rather than its literal query shape.
-- **`lock_timeout` is 3s and `statement_timeout` is 10s**, not the spec's
-  example values of 10s/15s - see **Load characteristics** above. Tightening
-  `lock_timeout` is what makes "zero 5xx under a ~20k burst" actually true
-  on a pool sized at the spec's own default (`PG_POOL_MAX=20`) rather than
-  only true at a smaller scale.
-- **A defensive `isTransientInfraError` fallback** (in `src/lib/retry.js`,
-  used by the reserve/cancel/confirm handlers and as a last resort in the
-  global error handler) converts a retry-exhausted lock/serialization/
-  statement-timeout error, or the pg pool failing to hand out a connection
-  in time, into a `409` decline instead of a `500`. This isn't in the spec's
-  algorithm description, but the spec's own hard requirement ("ZERO 5xx
-  under a ~20,000 concurrent request burst") doesn't hold without it on
-  real hardware under real contention - verified by the burst script, which
-  found exactly this failure mode on the first full-scale run.
-- **Docker/compose were not executed locally** - this environment doesn't
-  have Docker installed. The Dockerfile, `docker-compose.yml`, and the CI
-  workflow's docker job were written carefully against the spec (multi-stage
-  not required, `npm ci --omit=dev`, non-root user, healthcheck-gated
-  `depends_on`) but are unverified beyond review. `npm test` and the full
-  20,000-request burst **were** run and verified directly against the
-  locally-running app (embedded Postgres + `node src/server.js`), which
-  exercises the identical application code the Docker image runs.
+> TODO (candidate): in your own words - what you directed, what you
+> questioned, changed or rejected, and what you verified yourself. Be
+> specific; this section is graded on honesty.
 
 ## What I'd do next
 

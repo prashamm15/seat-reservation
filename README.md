@@ -144,6 +144,11 @@ is `409 {"error":"idempotency_key_reused"}`. A **declined** attempt is never
 stored, so retrying with the same key after a decline re-evaluates from
 scratch rather than replaying the decline (see `WRITEUP.md`).
 
+Under extreme overload (no DB connection or row lock obtainable in time) the
+service sheds load with `429 {"error":"busy"}` + `Retry-After: 1`. Nothing was
+written, so retry with the **same** idempotency key. It never answers 5xx for
+contention, and never claims a seat is taken when it couldn't check.
+
 ### `POST /reservations/:id/cancel` (owner only)
 
 ```bash
