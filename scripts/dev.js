@@ -4,6 +4,7 @@
 // Boots an embedded Postgres instance + the Fastify server, entirely locally,
 // no Docker required. Ctrl+C shuts both down cleanly.
 
+const fs = require('fs');
 const path = require('path');
 
 async function main() {
@@ -21,8 +22,11 @@ async function main() {
   });
 
   console.log(`[dev] starting embedded Postgres on port ${port} (${dataDir})...`);
-  // initialise() is a no-op if the data directory already exists from a previous run.
-  await pg.initialise();
+  // initialise() runs initdb, which FAILS on a non-empty directory — so only call it on
+  // the first run; later runs reuse the existing cluster.
+  if (!fs.existsSync(path.join(dataDir, 'PG_VERSION'))) {
+    await pg.initialise();
+  }
   await pg.start();
   try {
     await pg.createDatabase('paytm');

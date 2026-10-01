@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node scripts/dev.js",
-    "test": "node --test",
+    "test": "node --test test/*.test.js",
     "burst": "node scripts/burst.js"
   },
   "dependencies": {
