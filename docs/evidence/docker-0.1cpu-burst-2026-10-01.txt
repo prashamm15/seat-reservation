@@ -1,0 +1,90 @@
+=== burst: http://localhost:8080 requests=20000 concurrency=1000 seats=2000 hot=5 storm=500 ===
+--- waiting for /readyz ---
+  [PASS] service became ready within 90s
+--- creating show ---
+  [PASS] show created - status=201
+  show id = 08e8ccac-f892-42cf-be3a-710d5e02066f, seats = 2000
+--- minting 2000 user tokens ---
+  [PASS] tokens minted - 2000/2000
+--- phase A: hot-seat storm (5 seats x 500 users) ---
+  [PASS] hot seat A1 has exactly one winner - winners=1
+  [PASS] hot seat A2 has exactly one winner - winners=1
+  [PASS] hot seat A3 has exactly one winner - winners=1
+  [PASS] hot seat A4 has exactly one winner - winners=1
+  [PASS] hot seat A5 has exactly one winner - winners=1
+--- phase B: stampede (20000 requests, concurrency 1000) ---
+--- phase C: per-user limit ---
+  [PASS] found 10 free seats for per-user-limit phase - found=10
+  [PASS] per-user limit: at most 4 of 10 parallel reserves succeeded - succeeded=4
+  [PASS] every successful per-user-limit reservation verifies as confirmed via GET
+--- phase D: identity ---
+  [PASS] found at least 2 free seats for identity phase - found=272
+  [PASS] user X reserved a seat - status=201
+  [PASS] spoofed user_id in body is ignored - reservation belongs to the token holder (Y) - status=201 user_id=burst-identity-y-1790860499285
+  [PASS] Y cannot cancel X's reservation (403) - status=403
+  [PASS] X can cancel their own reservation (200) - status=200
+  [PASS] cancelled seat shows available again - status=available
+  [PASS] the freed seat is re-bookable by someone else - status=201
+--- final reconciliation ---
+  [PASS] available + held + confirmed == total - {"available":270,"held":0,"confirmed":1730,"total":2000}
+  [PASS] invariant_ok is true
+  [PASS] reconciliation.ok is true - {"seats_held_or_confirmed":1730,"seats_in_active_reservations":1730,"ok":true}
+  [PASS] confirmed seat count matches distinct won seats (201 or replayed) minus cancelled seats - actual=1730 expected=1730
+--- metrics scrape ---
+  reservations_confirmed_total{mode="confirmed"} 1486
+  reservations_declined_total{reason="seat_taken"} 23577
+  reservations_declined_total{reason="idempotent_replay"} 149
+  reservations_declined_total{reason="per_user_limit"} 21
+  reservations_declined_total{reason="idempotency_key_reused"} 36
+  reservations_cancelled_total 1
+  holds_confirmed_total 0
+  holds_expired_seats_total 0
+  seats_confirmed_total 1731
+  http_5xx_total 1
+
+=== SUMMARY ===
+total reserve requests observed : 24921
+  201 confirmed/held            : 1477
+  200 replay                    : 148
+  409 seat_unavailable             : 23239
+  409 per_user_limit               : 21
+  409 idempotency_key_reused       : 36
+  4xx other                     : 0
+  429 busy after 5 retries      : 0  (429s retried with same key: 0)
+  5xx (MUST be 0)               : 0
+  network errors/timeouts       : 0  (timeouts retried with same key: 1083)
+latency p50/p95/p99/max (ms)     : 11898/31310/44902/59804
+
+hot seat winners:
+  A1: 1 winner(s)
+  A2: 1 winner(s)
+  A3: 1 winner(s)
+  A4: 1 winner(s)
+  A5: 1 winner(s)
+
+=== CHECKS ===
+  [PASS] service became ready within 90s
+  [PASS] show created
+  [PASS] tokens minted
+  [PASS] hot seat A1 has exactly one winner
+  [PASS] hot seat A2 has exactly one winner
+  [PASS] hot seat A3 has exactly one winner
+  [PASS] hot seat A4 has exactly one winner
+  [PASS] hot seat A5 has exactly one winner
+  [PASS] found 10 free seats for per-user-limit phase
+  [PASS] per-user limit: at most 4 of 10 parallel reserves succeeded
+  [PASS] every successful per-user-limit reservation verifies as confirmed via GET
+  [PASS] found at least 2 free seats for identity phase
+  [PASS] user X reserved a seat
+  [PASS] spoofed user_id in body is ignored - reservation belongs to the token holder (Y)
+  [PASS] Y cannot cancel X's reservation (403)
+  [PASS] X can cancel their own reservation (200)
+  [PASS] cancelled seat shows available again
+  [PASS] the freed seat is re-bookable by someone else
+  [PASS] available + held + confirmed == total
+  [PASS] invariant_ok is true
+  [PASS] reconciliation.ok is true
+  [PASS] confirmed seat count matches distinct won seats (201 or replayed) minus cancelled seats
+  [PASS] zero 5xx responses
+
+RESULT: PASS

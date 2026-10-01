@@ -62,6 +62,12 @@ healthcheck-gated `depends_on`. The API is on `http://localhost:8080`.
    burst script waits for `/readyz`). The admin token is shared privately, not
    committed.
 
+## Evidence
+
+- [`docs/evidence/live-burst-render-2026-10-01.txt`](docs/evidence/live-burst-render-2026-10-01.txt) - full output of `./burst.sh` against the live Render URL (20k requests, PASS, 0 5xx).
+- [`docs/evidence/docker-0.1cpu-burst-2026-10-01.txt`](docs/evidence/docker-0.1cpu-burst-2026-10-01.txt) - the same burst against the Docker image capped at 0.1 CPU.
+- [GitHub Actions](https://github.com/prashamm15/seat-reservation/actions) - every push runs the test suite, then builds the Docker image, starts it with Postgres via compose and runs the burst against it.
+
 ## Configuration (env vars)
 
 | Var | Default | Notes |
