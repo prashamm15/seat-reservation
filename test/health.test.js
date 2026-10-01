@@ -49,3 +49,21 @@ test('readiness fails closed when the DB is unreachable', async (t) => {
   assert.equal(show.body.error, 'database_unavailable');
   assert.ok(show.headers.get('retry-after'));
 });
+
+// Regression (seen live on Render): readiness used the request pool, so under a
+// burst the probe queued behind reservations, timed out, and the platform marked
+// a healthy instance as down. Readiness must stay 200 while the pool is saturated.
+test('readiness stays 200 while every request-pool connection is busy', async (t) => {
+  const db = await setupTestDb();
+  const server = await startTestApp(db.databaseUrl, { poolMax: 2 });
+  const held = [await server.pool.connect(), await server.pool.connect()];
+  t.after(async () => {
+    held.forEach((c) => c.release());
+    await server.close();
+    await db.teardown();
+  });
+
+  assert.equal(server.pool.idleCount, 0);
+  const r = await jsonFetch(`${server.baseUrl}/readyz`);
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+});

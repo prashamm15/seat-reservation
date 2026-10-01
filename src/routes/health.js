@@ -1,6 +1,27 @@
 'use strict';
 
+const { Pool } = require('pg');
+
+const READY_TIMEOUT_MS = 2000;
+
 async function healthRoutes(app, { pool, state }) {
+  // Readiness gets its OWN single connection. If it shared the request pool, a burst
+  // would queue the probe behind thousands of reservations, it would time out, and the
+  // platform would mark a perfectly healthy instance as down and start dropping
+  // traffic at the proxy (observed on Render). The question readiness answers is
+  // "is the database reachable?", not "is the request pool busy?" — pool saturation
+  // is reported separately via db_pool_waiting.
+  const probePool = new Pool({
+    ...pool.options,
+    max: 1,
+    connectionTimeoutMillis: READY_TIMEOUT_MS,
+    idleTimeoutMillis: 30000,
+  });
+  probePool.on('error', () => {}); // idle-client errors surface on the next probe instead
+  app.addHook('onClose', async () => {
+    await probePool.end().catch(() => {});
+  });
+
   app.get('/healthz', async () => {
     return { status: 'ok' };
   });
@@ -10,13 +31,13 @@ async function healthRoutes(app, { pool, state }) {
       return reply.code(503).send({ status: 'not_ready', db: 'migrations not yet applied' });
     }
     try {
-      const queryPromise = pool.query('SELECT 1');
-      // Avoid an unhandled rejection if the 1s timeout wins the race and the
+      const queryPromise = probePool.query('SELECT 1');
+      // Avoid an unhandled rejection if the timeout wins the race and the
       // real query rejects later (e.g. a slow DNS failure against a bad host).
       queryPromise.catch(() => {});
       await Promise.race([
         queryPromise,
-        new Promise((_, reject) => setTimeout(() => reject(new Error('db check timed out')), 1000)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('db check timed out')), READY_TIMEOUT_MS)),
       ]);
       return { status: 'ready', db: 'ok' };
     } catch (err) {
