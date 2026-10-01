@@ -1,5 +1,11 @@
 # Paytm Seat Reservation API
 
+**Live:** https://paytm-seat-reservation.onrender.com  ·  metrics: [`/metrics`](https://paytm-seat-reservation.onrender.com/metrics)  ·  logs: [`/logs`](https://paytm-seat-reservation.onrender.com/logs?limit=50)  ·  health: [`/readyz`](https://paytm-seat-reservation.onrender.com/readyz)
+
+```bash
+ADMIN_TOKEN=<shared privately> ./burst.sh https://paytm-seat-reservation.onrender.com
+```
+
 A JSON HTTP API that sells assigned seats for a show under heavy contention.
 It never double-sells a seat, never exceeds a per-user limit, never double-books
 a retried request, and keeps `available + held + confirmed == total_seats` true
@@ -51,8 +57,10 @@ healthcheck-gated `depends_on`. The API is on `http://localhost:8080`.
    and generates `JWT_SECRET`/`ADMIN_TOKEN` for you.
 3. Find the generated `ADMIN_TOKEN` in the Render dashboard under the web
    service's **Environment** tab once the blueprint has deployed.
-4. **Live URL:** `https://<your-service>.onrender.com` - **TODO (candidate):
-   fill in the actual deployed URL here.**
+4. **Live URL:** https://paytm-seat-reservation.onrender.com (free tier: the
+   first request after ~15 min idle takes ~50s while the instance wakes; the
+   burst script waits for `/readyz`). The admin token is shared privately, not
+   committed.
 
 ## Configuration (env vars)
 

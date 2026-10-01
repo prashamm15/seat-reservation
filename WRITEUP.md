@@ -215,12 +215,38 @@ show - **0 5xx, 0 network errors, 0 load-shed (429)**, exactly one winner per
 hot seat, p50/p95/p99/max ~300ms/1.2s/1.35s/1.4s, and every Prometheus
 counter equal to the client-observed outcome counts.
 
-Free hosting tiers (Render free: ~0.1 shared CPU, free Postgres with a low
-connection cap, spin-down after idle) are much slower; the design is the
-same but latency rises, so run the burst with a lower `--concurrency` there.
-A cold start takes ~1 minute; the burst script waits up to 90s for
-`/readyz` before starting. Keep `PG_POOL_MAX` comfortably under the
-database's `max_connections` (migrations and the sweeper need slots too).
+**Live, on Render's free tier** (`./burst.sh https://paytm-seat-reservation.onrender.com
+--requests 20000 --concurrency 1000`, 5 x 500-user hot-seat storm): **PASS -
+0 5xx, exactly one winner per hot seat, invariant and reconciliation exact**,
+~25k reserve requests in 267s, p50/p95/p99 8.7s/23.8s/42.9s. 261 requests
+outlived the client's 60s timeout and were retried with the same idempotency
+key; every one resolved (as a replay if it had committed), none lost, none
+double-booked.
+
+**Where the time goes on free tier - measured, not guessed.** Sampling
+`/metrics` every 10s during that run: event-loop p99 lag stayed at 30-100ms
+(the 0.1-CPU app is *not* the bottleneck), while `db_pool_waiting` sat at
+~1,050 with `db_pool_idle` 0 for the whole stampede. The free Postgres is the
+ceiling: every connection is busy and requests queue for one. The fix for
+more throughput is a bigger database (or more app replicas only after that),
+not more app CPU. Locally, with unthrottled Postgres, the same burst
+finishes in ~13s.
+
+Two production issues were found *only* by bursting the live deployment:
+
+- **Proxy 5xx caused by the health check.** `/readyz` shared the request
+  pool, so under load it queued behind reservations, timed out and returned
+  503. Render polls `/readyz` as its health check, marked the instance
+  unhealthy, and its proxy answered 161 requests with 5xx that never reached
+  the app (app-side reservation 5xx: 0). Readiness now probes on its own
+  dedicated connection; it answers "is the DB reachable", while pool
+  saturation is reported by `db_pool_waiting`. The burst script now labels
+  every 5xx as `from app` vs `from upstream proxy` (app responses always
+  carry `X-Request-Id`).
+- **CPU per request.** Profiling a 20k burst cut busy CPU per request ~27%:
+  immutable shows cached in memory, seat pre-check + idempotency lookup
+  merged into one statement (same snapshot, so still correct), one log line
+  per request, async coalesced stdout, verified-JWT cache.
 
 **Overload behaviour.** A request that cannot get a pool connection (60s) or
 a row lock (`lock_timeout` 3s, after 3 retries) answers **429 `busy`** with
