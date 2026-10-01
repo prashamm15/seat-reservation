@@ -42,4 +42,10 @@ test('readiness fails closed when the DB is unreachable', async (t) => {
   // Liveness must still be fine - it never touches the DB.
   const live = await jsonFetch(`${server.baseUrl}/healthz`);
   assert.equal(live.status, 200);
+
+  // Writes fail closed with an explicit 503, not a generic 500 "unexpected error".
+  const show = await jsonFetch(`${server.baseUrl}/shows/00000000-0000-4000-8000-000000000000`);
+  assert.equal(show.status, 503);
+  assert.equal(show.body.error, 'database_unavailable');
+  assert.ok(show.headers.get('retry-after'));
 });

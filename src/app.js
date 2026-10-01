@@ -7,7 +7,7 @@ const config = require('./config');
 const { loggerInstance } = require('./logger');
 const metrics = require('./metrics');
 const { AppError } = require('./errors');
-const { isTransientInfraError } = require('./lib/retry');
+const { isTransientInfraError, isDbUnavailableError } = require('./lib/retry');
 
 const REQUEST_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 
@@ -76,6 +76,12 @@ function buildApp({ pool, state }) {
     }
     if (err.statusCode && err.statusCode < 500) {
       return reply.code(err.statusCode).send({ error: 'invalid_request', message: err.message });
+    }
+    if (isDbUnavailableError(err)) {
+      // Fail closed: the system of record is unreachable, so nothing was decided or written.
+      req.log.error({ err: err.message }, 'database unavailable');
+      reply.header('Retry-After', '5');
+      return reply.code(503).send({ error: 'database_unavailable', message: 'the database is unreachable; nothing was changed, retry with the same idempotency key' });
     }
     if (isTransientInfraError(err)) {
       // Belt-and-suspenders: the main reserve/cancel/confirm transactions already

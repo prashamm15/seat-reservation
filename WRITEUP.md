@@ -136,8 +136,13 @@ owner throughout.
 This is a **CP** system by construction: a single Postgres primary is the
 only source of truth, and every write-path decision (lock a seat, enforce
 the limit, record a reservation) happens inside one of its transactions.
-If the primary is unreachable, `/readyz` fails closed (503) and every write
-endpoint fails too (the pool simply can't produce a connection) - the
+If the primary is unreachable, `/readyz` fails closed (503) and every
+DB-backed endpoint answers an explicit `503 database_unavailable` with
+`Retry-After` - nothing is decided or written, so retrying the same
+idempotency key later is safe. `/healthz` stays 200 (the process is fine, so
+the orchestrator should not restart-loop it), and the pool reconnects on its
+own when the DB returns - verified by stopping the Postgres container under
+`docker compose` and starting it again without restarting the app. The
 system chooses to refuse requests over risking a double-sell, which is the
 correct tradeoff for inventory with a hard physical limit (there is no sane
 way to "heal" two people holding the same physical seat after the fact).

@@ -45,9 +45,22 @@ function isTransientInfraError(err) {
   if (err.code === '57014') return true; // statement_timeout
   const msg = String(err.message || '');
   if (/timeout exceeded when trying to connect/i.test(msg)) return true;
-  if (/connection terminated/i.test(msg)) return true;
   if (/too many clients/i.test(msg)) return true;
   return false;
 }
 
-module.exports = { withRetry, RETRYABLE_CODES, isTransientInfraError };
+// The database itself is unreachable (down, restarting, DNS gone, connection cut).
+// Distinct from overload: the right answer is 503 + Retry-After, failing closed —
+// nothing is written while the source of truth is unavailable.
+const DB_UNAVAILABLE_NET_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ETIMEDOUT', 'ECONNRESET', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE']);
+
+function isDbUnavailableError(err) {
+  if (!err) return false;
+  if (DB_UNAVAILABLE_NET_CODES.has(err.code)) return true;
+  // 08xxx connection exceptions; 57P01-57P03 admin shutdown / crash / cannot connect now
+  if (typeof err.code === 'string' && (/^08/.test(err.code) || /^57P0[123]$/.test(err.code))) return true;
+  const msg = String(err.message || '');
+  return /connection terminated|Connection refused|the database system is (starting up|shutting down)/i.test(msg);
+}
+
+module.exports = { withRetry, RETRYABLE_CODES, isTransientInfraError, isDbUnavailableError };
