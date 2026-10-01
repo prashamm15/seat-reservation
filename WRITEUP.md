@@ -288,22 +288,31 @@ burst exposed them.
 
 ## AI usage
 
-AI was used heavily, through Claude Code:
+**Ownership and responsibility:** I own this submission and am responsible for
+the system's behaviour. I used AI extensively, as the assignment encourages,
+and directed how it was used.
 
-- **Claude Opus 5.5** wrote the design brief the implementation followed:
-  the data model, the exact lock order (idempotency unique key -> per-user
-  advisory lock -> seat rows `ORDER BY label FOR UPDATE` -> guarded
-  `UPDATE`), lazy hold expiry with the `reservation_id` guard, the metric
-  and endpoint list, and the burst-script phases.
-- **Claude Sonnet 5** implemented that brief, wrote the test suite and the
-  burst script, and ran them.
-- **Claude Opus 5.5** then reviewed the code and re-ran the tests and the
-  20k burst independently. That review found bugs 1-5 above, including the
-  pool deadlock that the implementation pass had masked rather than fixed.
-
-> TODO (candidate): in your own words - what you directed, what you
-> questioned, changed or rejected, and what you verified yourself. Be
-> specific; this section is graded on honesty.
+- **Direction and model choice:** I split the work across models: Claude
+  Opus 5.5 for design, review and verification, and Claude Sonnet for
+  implementation, to balance quality against cost.
+- **Design and architecture:** AI (Opus) produced the design, which I
+  accepted: the data model and the atomic-decision flow (idempotency unique
+  key -> per-user advisory lock -> deterministic seat-row lock order ->
+  guarded `UPDATE`), lazy hold expiry, and the metrics set.
+- **Implementation:** AI (Sonnet) wrote the service, the tests and the burst
+  script.
+- **Testing and review:** I had a second, independent AI pass (Opus) review
+  and test the implementation. It found bugs the first pass had missed -
+  notably a connection-pool self-deadlock under same-key retries (see *Bugs
+  found by load-testing*) - and implemented the fixes, each pinned by a test
+  that fails on the old code.
+- **Infrastructure and deployment (me):** I set up Docker with WSL2 locally
+  so the image could be verified, approved publishing the repository, and
+  deployed to Render using the Blueprint.
+- **Production verification:** I deployed the service so it could be
+  burst-tested live. That surfaced two production-only issues - proxy 5xx
+  caused by the health check, and the free-tier database being the
+  bottleneck - which were then fixed and re-verified against the live URL.
 
 ## What I'd do next
 
