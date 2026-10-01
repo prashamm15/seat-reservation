@@ -6,7 +6,7 @@ const { setupTestDb } = require('./helpers/testDb');
 const { startTestApp } = require('./helpers/testApp');
 const { makeClient } = require('./helpers/client');
 
-const ADMIN = 'dev-admin-token';
+const ADMIN = require('../src/config').adminToken;
 
 test('idempotency', async (t) => {
   const db = await setupTestDb();

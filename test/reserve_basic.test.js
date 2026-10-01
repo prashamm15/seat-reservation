@@ -6,7 +6,7 @@ const { setupTestDb } = require('./helpers/testDb');
 const { startTestApp } = require('./helpers/testApp');
 const { makeClient } = require('./helpers/client');
 
-const ADMIN = 'dev-admin-token';
+const ADMIN = require('../src/config').adminToken;
 
 async function freshShow(client, seats, overrides = {}) {
   const r = await client.createShow(ADMIN, Object.assign({ name: 'Show', seats, price_paise: 1000 }, overrides));

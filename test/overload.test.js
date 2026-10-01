@@ -13,7 +13,7 @@ const { setupTestDb } = require('./helpers/testDb');
 const { startTestApp } = require('./helpers/testApp');
 const { makeClient } = require('./helpers/client');
 
-const ADMIN = 'dev-admin-token';
+const ADMIN = require('../src/config').adminToken;
 
 test('overload: lock contention past lock_timeout sheds load as 429, writes nothing', async (t) => {
   const db = await setupTestDb();

@@ -7,7 +7,7 @@ const { startTestApp } = require('./helpers/testApp');
 const { makeClient } = require('./helpers/client');
 const { sweepOnce } = require('../src/lib/sweeper');
 
-const ADMIN = 'dev-admin-token';
+const ADMIN = require('../src/config').adminToken;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));

@@ -55,7 +55,7 @@ test('auth', async (t) => {
   });
 
   await t.test('admin endpoint with the correct admin token succeeds', async () => {
-    const r = await client.createShow('dev-admin-token', {
+    const r = await client.createShow(require('../src/config').adminToken, {
       name: 'Admin Auth Test',
       seats: ['A1', 'A2'],
       price_paise: 100,
