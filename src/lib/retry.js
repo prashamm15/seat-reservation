@@ -32,4 +32,22 @@ async function withRetry(fn, { maxAttempts = 3, baseDelayMs = 20 } = {}) {
   throw lastErr;
 }
 
-module.exports = { withRetry, RETRYABLE_CODES };
+/**
+ * True for infra-level hiccups under extreme load (lock/statement timeouts that
+ * survived every retry, or the pg pool itself failing to hand out a connection in
+ * time). The spec requires zero 5xx even under a ~20k-request burst, so every call
+ * site that can hit these must treat them as a decline, never let them become an
+ * unhandled 500.
+ */
+function isTransientInfraError(err) {
+  if (!err) return false;
+  if (RETRYABLE_CODES.has(err.code)) return true;
+  if (err.code === '57014') return true; // statement_timeout
+  const msg = String(err.message || '');
+  if (/timeout exceeded when trying to connect/i.test(msg)) return true;
+  if (/connection terminated/i.test(msg)) return true;
+  if (/too many clients/i.test(msg)) return true;
+  return false;
+}
+
+module.exports = { withRetry, RETRYABLE_CODES, isTransientInfraError };

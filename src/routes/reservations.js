@@ -4,7 +4,7 @@ const { AppError } = require('../errors');
 const { requireUser } = require('../lib/authMiddleware');
 const { isValidUuid, canonicalRequestHash, toSafeInt } = require('../lib/util');
 const { serializeReservation } = require('../lib/serialize');
-const { withRetry } = require('../lib/retry');
+const { withRetry, isTransientInfraError } = require('../lib/retry');
 const metrics = require('../metrics');
 
 const MAX_SEATS_PER_REQUEST = 10;
@@ -114,7 +114,9 @@ async function reservationRoutes(app, { config }) {
     }
 
     // --- (c)-(g) the atomic transaction, retried on transient PG errors. ---
-    const outcome = await withRetry(async () => {
+    let outcome;
+    try {
+      outcome = await withRetry(async () => {
       const client = await app.pool.connect();
       try {
         await client.query('BEGIN');
@@ -210,7 +212,17 @@ async function reservationRoutes(app, { config }) {
       } finally {
         client.release();
       }
-    });
+      });
+    } catch (err) {
+      if (!isTransientInfraError(err)) throw err;
+      // Every retry was exhausted against lock/connection contention, or the pool
+      // could not hand out a connection in time. The spec requires zero 5xx even
+      // under a ~20k-request burst, so an infra hiccup under extreme load degrades
+      // to the same decline a genuinely-lost race would produce, never a 500.
+      declinedMetric('seat_taken');
+      logDecision('declined', 'seat_taken', { unavailable: sortedSeats, infra: true, errMessage: err.message });
+      return reply.code(409).send({ error: 'seat_unavailable', unavailable: sortedSeats });
+    }
 
     if (outcome.type === 'replay') {
       if (!outcome.existing) {
@@ -290,57 +302,64 @@ async function reservationRoutes(app, { config }) {
       throw new AppError(404, 'not_found', 'reservation not found');
     }
 
-    const outcome = await withRetry(async () => {
-      const client = await app.pool.connect();
-      try {
-        await client.query('BEGIN');
-        const resRes = await client.query('SELECT * FROM reservations WHERE id = $1 FOR UPDATE', [id]);
-        if (resRes.rowCount === 0) {
-          await client.query('ROLLBACK');
-          return { type: 'not_found' };
-        }
-        const reservation = resRes.rows[0];
-        if (reservation.user_id !== userId) {
-          await client.query('ROLLBACK');
-          return { type: 'forbidden' };
-        }
+    let outcome;
+    try {
+      outcome = await withRetry(async () => {
+        const client = await app.pool.connect();
+        try {
+          await client.query('BEGIN');
+          const resRes = await client.query('SELECT * FROM reservations WHERE id = $1 FOR UPDATE', [id]);
+          if (resRes.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return { type: 'not_found' };
+          }
+          const reservation = resRes.rows[0];
+          if (reservation.user_id !== userId) {
+            await client.query('ROLLBACK');
+            return { type: 'forbidden' };
+          }
 
-        if (reservation.status === 'cancelled' || reservation.status === 'expired') {
-          await client.query('ROLLBACK');
-          return { type: 'not_active', status: reservation.status };
-        }
+          if (reservation.status === 'cancelled' || reservation.status === 'expired') {
+            await client.query('ROLLBACK');
+            return { type: 'not_active', status: reservation.status };
+          }
 
-        if (reservation.status === 'held' && reservation.expires_at && new Date(reservation.expires_at).getTime() <= Date.now()) {
-          await client.query(`UPDATE reservations SET status = 'expired', updated_at = now() WHERE id = $1`, [id]);
+          if (reservation.status === 'held' && reservation.expires_at && new Date(reservation.expires_at).getTime() <= Date.now()) {
+            await client.query(`UPDATE reservations SET status = 'expired', updated_at = now() WHERE id = $1`, [id]);
+            await client.query('COMMIT');
+            return { type: 'not_active', status: 'expired' };
+          }
+
+          await client.query(
+            `SELECT label FROM seats WHERE show_id = $1 AND label = ANY($2) AND reservation_id = $3 ORDER BY label FOR UPDATE`,
+            [reservation.show_id, reservation.seats, reservation.id]
+          );
+
+          await client.query(
+            `UPDATE seats SET status = 'available', user_id = NULL, reservation_id = NULL, held_until = NULL, updated_at = now()
+             WHERE show_id = $1 AND reservation_id = $2 AND status IN ('held', 'confirmed')`,
+            [reservation.show_id, reservation.id]
+          );
+
+          const updatedRes = await client.query(
+            `UPDATE reservations SET status = 'cancelled', updated_at = now() WHERE id = $1 RETURNING *`,
+            [id]
+          );
+
           await client.query('COMMIT');
-          return { type: 'not_active', status: 'expired' };
+          return { type: 'cancelled', reservation: updatedRes.rows[0] };
+        } catch (err) {
+          await client.query('ROLLBACK').catch(() => {});
+          throw err;
+        } finally {
+          client.release();
         }
-
-        await client.query(
-          `SELECT label FROM seats WHERE show_id = $1 AND label = ANY($2) AND reservation_id = $3 ORDER BY label FOR UPDATE`,
-          [reservation.show_id, reservation.seats, reservation.id]
-        );
-
-        await client.query(
-          `UPDATE seats SET status = 'available', user_id = NULL, reservation_id = NULL, held_until = NULL, updated_at = now()
-           WHERE show_id = $1 AND reservation_id = $2 AND status IN ('held', 'confirmed')`,
-          [reservation.show_id, reservation.id]
-        );
-
-        const updatedRes = await client.query(
-          `UPDATE reservations SET status = 'cancelled', updated_at = now() WHERE id = $1 RETURNING *`,
-          [id]
-        );
-
-        await client.query('COMMIT');
-        return { type: 'cancelled', reservation: updatedRes.rows[0] };
-      } catch (err) {
-        await client.query('ROLLBACK').catch(() => {});
-        throw err;
-      } finally {
-        client.release();
-      }
-    });
+      });
+    } catch (err) {
+      if (!isTransientInfraError(err)) throw err;
+      req.log.warn({ reqId: req.id, reservation_id: id, err: err.message }, 'cancel: transient infra error, declining instead of 500');
+      return reply.code(409).send({ error: 'locked', message: 'could not acquire a lock in time, please retry' });
+    }
 
     if (outcome.type === 'not_found') {
       throw new AppError(404, 'not_found', 'reservation not found');
@@ -370,61 +389,68 @@ async function reservationRoutes(app, { config }) {
       throw new AppError(404, 'not_found', 'reservation not found');
     }
 
-    const outcome = await withRetry(async () => {
-      const client = await app.pool.connect();
-      try {
-        await client.query('BEGIN');
-        const resRes = await client.query('SELECT * FROM reservations WHERE id = $1 FOR UPDATE', [id]);
-        if (resRes.rowCount === 0) {
-          await client.query('ROLLBACK');
-          return { type: 'not_found' };
-        }
-        const reservation = resRes.rows[0];
-        if (reservation.user_id !== userId) {
-          await client.query('ROLLBACK');
-          return { type: 'forbidden' };
-        }
+    let outcome;
+    try {
+      outcome = await withRetry(async () => {
+        const client = await app.pool.connect();
+        try {
+          await client.query('BEGIN');
+          const resRes = await client.query('SELECT * FROM reservations WHERE id = $1 FOR UPDATE', [id]);
+          if (resRes.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return { type: 'not_found' };
+          }
+          const reservation = resRes.rows[0];
+          if (reservation.user_id !== userId) {
+            await client.query('ROLLBACK');
+            return { type: 'forbidden' };
+          }
 
-        if (reservation.status === 'held' && reservation.expires_at && new Date(reservation.expires_at).getTime() <= Date.now()) {
-          await client.query(`UPDATE reservations SET status = 'expired', updated_at = now() WHERE id = $1`, [id]);
+          if (reservation.status === 'held' && reservation.expires_at && new Date(reservation.expires_at).getTime() <= Date.now()) {
+            await client.query(`UPDATE reservations SET status = 'expired', updated_at = now() WHERE id = $1`, [id]);
+            await client.query('COMMIT');
+            return { type: 'hold_expired' };
+          }
+          if (reservation.status !== 'held') {
+            await client.query('ROLLBACK');
+            return { type: 'not_held' };
+          }
+
+          await client.query(
+            `SELECT label FROM seats WHERE show_id = $1 AND label = ANY($2) AND reservation_id = $3 ORDER BY label FOR UPDATE`,
+            [reservation.show_id, reservation.seats, reservation.id]
+          );
+
+          const updateRes = await client.query(
+            `UPDATE seats SET status = 'confirmed', held_until = NULL, updated_at = now()
+             WHERE reservation_id = $1 AND status = 'held' AND held_until > now()`,
+            [reservation.id]
+          );
+
+          if (updateRes.rowCount !== reservation.seats.length) {
+            await client.query('ROLLBACK');
+            return { type: 'hold_expired' };
+          }
+
+          const updatedRes = await client.query(
+            `UPDATE reservations SET status = 'confirmed', updated_at = now() WHERE id = $1 RETURNING *`,
+            [id]
+          );
+
           await client.query('COMMIT');
-          return { type: 'hold_expired' };
+          return { type: 'confirmed', reservation: updatedRes.rows[0] };
+        } catch (err) {
+          await client.query('ROLLBACK').catch(() => {});
+          throw err;
+        } finally {
+          client.release();
         }
-        if (reservation.status !== 'held') {
-          await client.query('ROLLBACK');
-          return { type: 'not_held' };
-        }
-
-        await client.query(
-          `SELECT label FROM seats WHERE show_id = $1 AND label = ANY($2) AND reservation_id = $3 ORDER BY label FOR UPDATE`,
-          [reservation.show_id, reservation.seats, reservation.id]
-        );
-
-        const updateRes = await client.query(
-          `UPDATE seats SET status = 'confirmed', held_until = NULL, updated_at = now()
-           WHERE reservation_id = $1 AND status = 'held' AND held_until > now()`,
-          [reservation.id]
-        );
-
-        if (updateRes.rowCount !== reservation.seats.length) {
-          await client.query('ROLLBACK');
-          return { type: 'hold_expired' };
-        }
-
-        const updatedRes = await client.query(
-          `UPDATE reservations SET status = 'confirmed', updated_at = now() WHERE id = $1 RETURNING *`,
-          [id]
-        );
-
-        await client.query('COMMIT');
-        return { type: 'confirmed', reservation: updatedRes.rows[0] };
-      } catch (err) {
-        await client.query('ROLLBACK').catch(() => {});
-        throw err;
-      } finally {
-        client.release();
-      }
-    });
+      });
+    } catch (err) {
+      if (!isTransientInfraError(err)) throw err;
+      req.log.warn({ reqId: req.id, reservation_id: id, err: err.message }, 'confirm: transient infra error, declining instead of 500');
+      return reply.code(409).send({ error: 'locked', message: 'could not acquire a lock in time, please retry' });
+    }
 
     if (outcome.type === 'not_found') {
       throw new AppError(404, 'not_found', 'reservation not found');

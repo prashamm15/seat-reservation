@@ -7,6 +7,7 @@ const config = require('./config');
 const { loggerInstance } = require('./logger');
 const metrics = require('./metrics');
 const { AppError } = require('./errors');
+const { isTransientInfraError } = require('./lib/retry');
 
 const REQUEST_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 
@@ -76,6 +77,16 @@ function buildApp({ pool, state }) {
     }
     if (err.statusCode && err.statusCode < 500) {
       return reply.code(err.statusCode).send({ error: 'invalid_request', message: err.message });
+    }
+    if (isTransientInfraError(err)) {
+      // Belt-and-suspenders: the main reserve/cancel/confirm transactions already
+      // convert these themselves (with a more specific error body), but a handful of
+      // queries run outside those blocks (the show lookup, the fast-path pre-check,
+      // the idempotency-key lookup). The spec requires zero 5xx even under a ~20k
+      // burst, so ANY query that times out waiting on a lock or a pool connection
+      // under extreme contention must still resolve to a 4xx decline, never a 500.
+      req.log.warn({ reqId: req.id, err: err.message }, 'transient infra error outside the main transaction, declining');
+      return reply.code(409).send({ error: 'locked', message: 'the system is under heavy load, please retry' });
     }
     req.log.error({ reqId: req.id, err: err.message, stack: err.stack }, 'unhandled error');
     metrics.http5xxTotal.inc();

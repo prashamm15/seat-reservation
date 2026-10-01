@@ -18,8 +18,13 @@ function createPool({ databaseUrl, max, ssl, logger }) {
   });
 
   pool.on('connect', (client) => {
-    client.query('SET statement_timeout = 15000').catch(() => {});
-    client.query('SET lock_timeout = 10000').catch(() => {});
+    // lock_timeout is deliberately short: under hot-row contention (many transactions
+    // racing to FOR UPDATE the same seat) a short timeout fails the loser fast so its
+    // pool connection is freed for the next attempt instead of parking it for seconds
+    // waiting on a lock it is very likely to lose anyway. withRetry() then retries a
+    // 55P03 quickly with jitter, which keeps overall pool turnover high under a burst.
+    client.query('SET statement_timeout = 10000').catch(() => {});
+    client.query('SET lock_timeout = 3000').catch(() => {});
   });
 
   pool.on('error', (err) => {
