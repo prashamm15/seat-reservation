@@ -3,8 +3,8 @@
 const { createPool, runMigrations } = require('../../src/db');
 const { buildApp } = require('../../src/app');
 
-async function startTestApp(databaseUrl, { skipMigrate } = {}) {
-  const pool = createPool({ databaseUrl, max: 15, ssl: false });
+async function startTestApp(databaseUrl, { skipMigrate, poolMax = 15 } = {}) {
+  const pool = createPool({ databaseUrl, max: poolMax, ssl: false });
   const state = { migrated: false };
   if (!skipMigrate) {
     await runMigrations(pool);

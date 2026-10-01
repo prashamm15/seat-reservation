@@ -50,6 +50,7 @@ function newStats() {
     replay200: 0,
     declinedByReason: {},
     other4xx: 0,
+    busy429: 0,
     serverErrors5xx: 0,
     networkErrors: 0,
     latencies: [],
@@ -70,6 +71,8 @@ function recordResult(stats, res) {
   } else if (res.status === 409) {
     const code = (res.body && res.body.error) || 'unknown_409';
     stats.declinedByReason[code] = (stats.declinedByReason[code] || 0) + 1;
+  } else if (res.status === 429) {
+    stats.busy429++;
   } else if (res.status >= 500) {
     stats.serverErrors5xx++;
   } else if (res.status >= 400) {
@@ -107,12 +110,23 @@ function authHeader(token) {
   return { authorization: `Bearer ${token}` };
 }
 
+// 429 = server shed load and wrote nothing. A correct client retries the SAME
+// idempotency key after Retry-After; idempotency makes that safe by construction.
+let busyRetries = 0;
 async function reserve(baseUrl, token, showId, payload, extraHeaders = {}) {
-  return httpJson(`${baseUrl}/shows/${showId}/reserve`, {
-    method: 'POST',
-    headers: Object.assign({ 'content-type': 'application/json' }, authHeader(token), extraHeaders),
-    body: JSON.stringify(payload),
-  });
+  let res;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    res = await httpJson(`${baseUrl}/shows/${showId}/reserve`, {
+      method: 'POST',
+      headers: Object.assign({ 'content-type': 'application/json' }, authHeader(token), extraHeaders),
+      body: JSON.stringify(payload),
+    });
+    if (res.status !== 429) return res;
+    busyRetries++;
+    const after = Number((res.headers && res.headers.get('retry-after')) || 1);
+    await sleep(after * 1000 * (0.5 + Math.random()));
+  }
+  return res;
 }
 
 async function cancel(baseUrl, token, reservationId) {
@@ -458,6 +472,7 @@ async function main() {
     console.log(`  409 ${reason.padEnd(24)}     : ${count}`);
   }
   console.log(`  4xx other                     : ${globalStats.other4xx}`);
+  console.log(`  429 busy after 5 retries      : ${globalStats.busy429}  (429s retried with same key: ${busyRetries})`);
   console.log(`  5xx (MUST be 0)               : ${globalStats.serverErrors5xx}`);
   console.log(`  network errors/timeouts       : ${globalStats.networkErrors}`);
   console.log(`latency p50/p95/p99/max (ms)     : ${p50}/${p95}/${p99}/${max}`);

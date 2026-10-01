@@ -37,6 +37,16 @@ function declinedMetric(reason) {
   metrics.reservationsDeclinedTotal.inc({ reason });
 }
 
+// Load shedding: the request could not get a DB connection / lock in time and
+// nothing was written. 429 + Retry-After tells the client to retry the SAME
+// idempotency key, which is safe by construction.
+function sendBusy(reply, logDecision, err) {
+  declinedMetric('overloaded');
+  if (logDecision) logDecision('declined', 'overloaded', { err: err.message });
+  reply.header('Retry-After', '1');
+  return reply.code(429).send({ error: 'busy', message: 'system is under heavy load, retry with the same idempotency key' });
+}
+
 async function reservationRoutes(app, { config }) {
   const userAuth = requireUser(config);
 
@@ -76,7 +86,7 @@ async function reservationRoutes(app, { config }) {
     const logDecision = (outcome, reason, extra) => {
       req.log.info(
         Object.assign(
-          { reqId: req.id, user_id: userId, show_id: showId, outcome, reason, seats: sortedSeats },
+          { user_id: userId, show_id: showId, outcome, reason, seats: sortedSeats },
           extra
         ),
         'reservation_decision'
@@ -133,7 +143,10 @@ async function reservationRoutes(app, { config }) {
 
         if (insertRes.rowCount === 0) {
           await client.query('ROLLBACK');
-          const existing = await findReservationByIdemKey(app.pool, userId, idempotencyKey);
+          // Must reuse THIS connection. Asking app.pool for a second one while holding
+          // this one self-deadlocks the pool under a burst (every connection held by a
+          // request waiting for one more) — the root cause of the earlier 60s stalls.
+          const existing = await findReservationByIdemKey(client, userId, idempotencyKey);
           return { type: 'replay', existing };
         }
 
@@ -158,8 +171,11 @@ async function reservationRoutes(app, { config }) {
         }
 
         // (f) lock the requested seats in a deterministic order to avoid deadlocks.
+        // "Free" is evaluated by Postgres against the DB clock (never the app clock), so the
+        // app and DB can never disagree about whether a hold has expired.
         const lockRes = await client.query(
-          `SELECT label, status, held_until FROM seats
+          `SELECT label, (status = 'available' OR (status = 'held' AND held_until <= now())) AS free
+           FROM seats
            WHERE show_id = $1 AND label = ANY($2)
            ORDER BY label FOR UPDATE`,
           [showId, sortedSeats]
@@ -172,12 +188,7 @@ async function reservationRoutes(app, { config }) {
           return { type: 'unknown_seat', unknown };
         }
 
-        const now = Date.now();
-        const notFree = lockRes.rows.filter((r) => {
-          if (r.status === 'available') return false;
-          if (r.status === 'held' && r.held_until && new Date(r.held_until).getTime() <= now) return false;
-          return true;
-        });
+        const notFree = lockRes.rows.filter((r) => !r.free);
         if (notFree.length > 0) {
           await client.query('ROLLBACK');
           return { type: 'seat_unavailable', unavailable: notFree.map((r) => r.label) };
@@ -185,7 +196,11 @@ async function reservationRoutes(app, { config }) {
 
         // (g) claim the seats, guarded on effective status so a concurrent winner can never be overwritten.
         const finalStatus = hold ? 'held' : 'confirmed';
-        const expiresAt = hold ? new Date(Date.now() + show.hold_ttl_seconds * 1000) : null;
+        let expiresAt = null;
+        if (hold) {
+          const expRes = await client.query('SELECT now() + make_interval(secs => $1) AS exp', [show.hold_ttl_seconds]);
+          expiresAt = expRes.rows[0].exp;
+        }
 
         const updateRes = await client.query(
           `UPDATE seats SET status = $3, user_id = $4, reservation_id = $5, held_until = $6, updated_at = now()
@@ -216,12 +231,11 @@ async function reservationRoutes(app, { config }) {
     } catch (err) {
       if (!isTransientInfraError(err)) throw err;
       // Every retry was exhausted against lock/connection contention, or the pool
-      // could not hand out a connection in time. The spec requires zero 5xx even
-      // under a ~20k-request burst, so an infra hiccup under extreme load degrades
-      // to the same decline a genuinely-lost race would produce, never a 500.
-      declinedMetric('seat_taken');
-      logDecision('declined', 'seat_taken', { unavailable: sortedSeats, infra: true, errMessage: err.message });
-      return reply.code(409).send({ error: 'seat_unavailable', unavailable: sortedSeats });
+      // could not hand out a connection in time. Nothing was written (the txn rolled
+      // back), so this is load shedding, NOT a lost race: report it honestly as a
+      // retryable 429 under its own metric reason instead of claiming the seat is
+      // taken — the seat may well still be free, and seat_taken must stay truthful.
+      return sendBusy(reply, logDecision, err);
     }
 
     if (outcome.type === 'replay') {
@@ -308,7 +322,10 @@ async function reservationRoutes(app, { config }) {
         const client = await app.pool.connect();
         try {
           await client.query('BEGIN');
-          const resRes = await client.query('SELECT * FROM reservations WHERE id = $1 FOR UPDATE', [id]);
+          const resRes = await client.query(
+            `SELECT *, (status = 'held' AND expires_at <= now()) AS hold_expired FROM reservations WHERE id = $1 FOR UPDATE`,
+            [id]
+          );
           if (resRes.rowCount === 0) {
             await client.query('ROLLBACK');
             return { type: 'not_found' };
@@ -324,7 +341,7 @@ async function reservationRoutes(app, { config }) {
             return { type: 'not_active', status: reservation.status };
           }
 
-          if (reservation.status === 'held' && reservation.expires_at && new Date(reservation.expires_at).getTime() <= Date.now()) {
+          if (reservation.hold_expired) {
             await client.query(`UPDATE reservations SET status = 'expired', updated_at = now() WHERE id = $1`, [id]);
             await client.query('COMMIT');
             return { type: 'not_active', status: 'expired' };
@@ -357,8 +374,7 @@ async function reservationRoutes(app, { config }) {
       });
     } catch (err) {
       if (!isTransientInfraError(err)) throw err;
-      req.log.warn({ reqId: req.id, reservation_id: id, err: err.message }, 'cancel: transient infra error, declining instead of 500');
-      return reply.code(409).send({ error: 'locked', message: 'could not acquire a lock in time, please retry' });
+      return sendBusy(reply, null, err);
     }
 
     if (outcome.type === 'not_found') {
@@ -373,7 +389,7 @@ async function reservationRoutes(app, { config }) {
 
     metrics.reservationsCancelledTotal.inc();
     req.log.info(
-      { reqId: req.id, user_id: userId, reservation_id: id, outcome: 'cancelled' },
+      { user_id: userId, reservation_id: id, outcome: 'cancelled' },
       'reservation_decision'
     );
     return serializeReservation(outcome.reservation);
@@ -395,7 +411,10 @@ async function reservationRoutes(app, { config }) {
         const client = await app.pool.connect();
         try {
           await client.query('BEGIN');
-          const resRes = await client.query('SELECT * FROM reservations WHERE id = $1 FOR UPDATE', [id]);
+          const resRes = await client.query(
+            `SELECT *, (status = 'held' AND expires_at <= now()) AS hold_expired FROM reservations WHERE id = $1 FOR UPDATE`,
+            [id]
+          );
           if (resRes.rowCount === 0) {
             await client.query('ROLLBACK');
             return { type: 'not_found' };
@@ -406,7 +425,7 @@ async function reservationRoutes(app, { config }) {
             return { type: 'forbidden' };
           }
 
-          if (reservation.status === 'held' && reservation.expires_at && new Date(reservation.expires_at).getTime() <= Date.now()) {
+          if (reservation.hold_expired) {
             await client.query(`UPDATE reservations SET status = 'expired', updated_at = now() WHERE id = $1`, [id]);
             await client.query('COMMIT');
             return { type: 'hold_expired' };
@@ -448,8 +467,7 @@ async function reservationRoutes(app, { config }) {
       });
     } catch (err) {
       if (!isTransientInfraError(err)) throw err;
-      req.log.warn({ reqId: req.id, reservation_id: id, err: err.message }, 'confirm: transient infra error, declining instead of 500');
-      return reply.code(409).send({ error: 'locked', message: 'could not acquire a lock in time, please retry' });
+      return sendBusy(reply, null, err);
     }
 
     if (outcome.type === 'not_found') {
@@ -468,7 +486,7 @@ async function reservationRoutes(app, { config }) {
     metrics.holdsConfirmedTotal.inc();
     metrics.seatsConfirmedTotal.inc(outcome.reservation.seats.length);
     req.log.info(
-      { reqId: req.id, user_id: userId, reservation_id: id, outcome: 'confirmed' },
+      { user_id: userId, reservation_id: id, outcome: 'confirmed' },
       'reservation_decision'
     );
     return serializeReservation(outcome.reservation);

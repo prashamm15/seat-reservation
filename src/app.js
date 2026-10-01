@@ -55,7 +55,6 @@ function buildApp({ pool, state }) {
     }
     req.log.info(
       {
-        reqId: req.id,
         method: req.method,
         route,
         status: reply.statusCode,
@@ -84,12 +83,16 @@ function buildApp({ pool, state }) {
       // queries run outside those blocks (the show lookup, the fast-path pre-check,
       // the idempotency-key lookup). The spec requires zero 5xx even under a ~20k
       // burst, so ANY query that times out waiting on a lock or a pool connection
-      // under extreme contention must still resolve to a 4xx decline, never a 500.
-      req.log.warn({ reqId: req.id, err: err.message }, 'transient infra error outside the main transaction, declining');
-      return reply.code(409).send({ error: 'locked', message: 'the system is under heavy load, please retry' });
+      // under extreme contention must still resolve to a retryable 429, never a 500.
+      req.log.warn({ err: err.message }, 'transient infra error outside the main transaction, shedding load');
+      if (req.routeOptions && req.routeOptions.url === '/shows/:id/reserve') {
+        metrics.reservationsDeclinedTotal.inc({ reason: 'overloaded' });
+      }
+      reply.header('Retry-After', '1');
+      return reply.code(429).send({ error: 'busy', message: 'system is under heavy load, please retry' });
     }
-    req.log.error({ reqId: req.id, err: err.message, stack: err.stack }, 'unhandled error');
-    metrics.http5xxTotal.inc();
+    req.log.error({ err: err.message, stack: err.stack }, 'unhandled error');
+    // http_5xx_total is incremented once, in the onResponse hook — not here too.
     return reply.code(500).send({ error: 'internal_error', message: 'an unexpected error occurred' });
   });
 
