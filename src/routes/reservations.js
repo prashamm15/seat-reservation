@@ -87,22 +87,30 @@ async function reservationRoutes(app, { config }) {
     // This ordering matters: a retry of a request whose original already committed
     // concurrently must always be recognised as a replay, never as seat_unavailable.
     const preCheck = await app.pool.query(
-      `SELECT array_agg(label) AS free_labels
+      `SELECT label, (status = 'available' OR (status = 'held' AND held_until <= now())) AS free
        FROM seats
-       WHERE show_id = $1 AND label = ANY($2)
-         AND (status = 'available' OR (status = 'held' AND held_until <= now()))`,
+       WHERE show_id = $1 AND label = ANY($2)`,
       [showId, sortedSeats]
     );
-    const freeLabels = new Set(preCheck.rows[0].free_labels || []);
-    if (freeLabels.size < sortedSeats.length) {
+    const knownLabels = new Map(preCheck.rows.map((r) => [r.label, r.free]));
+    const unknownLabels = sortedSeats.filter((s) => !knownLabels.has(s));
+    const takenLabels = sortedSeats.filter((s) => knownLabels.has(s) && !knownLabels.get(s));
+
+    if (unknownLabels.length > 0 || takenLabels.length > 0) {
       const existing = await findReservationByIdemKey(app.pool, userId, idempotencyKey);
       if (existing) {
         return replayResponse(existing, requestHash, reply, logDecision);
       }
-      const unavailable = sortedSeats.filter((s) => !freeLabels.has(s));
+      // Distinguish "doesn't exist" (400) from "exists but taken" (409) - a nonexistent
+      // seat is a client mistake, not contention, and deserves a different status code.
+      if (unknownLabels.length > 0) {
+        declinedMetric('unknown_seat');
+        logDecision('declined', 'unknown_seat', { unknown: unknownLabels });
+        return reply.code(400).send({ error: 'unknown_seat', unknown: unknownLabels });
+      }
       declinedMetric('seat_taken');
-      logDecision('declined', 'seat_taken', { unavailable });
-      return reply.code(409).send({ error: 'seat_unavailable', unavailable });
+      logDecision('declined', 'seat_taken', { unavailable: takenLabels });
+      return reply.code(409).send({ error: 'seat_unavailable', unavailable: takenLabels });
     }
 
     // --- (c)-(g) the atomic transaction, retried on transient PG errors. ---
