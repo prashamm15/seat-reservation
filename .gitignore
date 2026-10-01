@@ -1,0 +1,9 @@
+node_modules/
+.pgdata/
+*.log
+.env
+npm-debug.log*
+.DS_Store
+coverage/
+dist/
+*.tmp
