@@ -119,6 +119,7 @@ function authHeader(token) {
 // 429 = server shed load and wrote nothing. A correct client retries the SAME
 // idempotency key after Retry-After; idempotency makes that safe by construction.
 let busyRetries = 0;
+let timeoutRetries = 0;
 async function reserve(baseUrl, token, showId, payload, extraHeaders = {}) {
   let res;
   for (let attempt = 1; attempt <= 5; attempt++) {
@@ -127,6 +128,15 @@ async function reserve(baseUrl, token, showId, payload, extraHeaders = {}) {
       headers: Object.assign({ 'content-type': 'application/json' }, authHeader(token), extraHeaders),
       body: JSON.stringify(payload),
     });
+    if (res.networkError) {
+      // Timed out / connection dropped: the outcome is UNKNOWN (it may have committed).
+      // A correct client retries the same idempotency key - a committed original comes
+      // back as a 200 replay, so nothing is double-booked and nothing is lost.
+      if (attempt === 5) return res;
+      timeoutRetries++;
+      await sleep(500 + Math.random() * 1000);
+      continue;
+    }
     if (res.status !== 429) return res;
     busyRetries++;
     const after = Number((res.headers && res.headers.get('retry-after')) || 1);
@@ -245,7 +255,9 @@ async function main() {
 
   function noteReserveResult(res) {
     recordResult(globalStats, res);
-    if (res.status === 201 && res.body && res.body.reservation_id) {
+    // A winner's response can arrive as 201 or - if its first attempt timed out and
+    // was retried with the same key - as a 200 replay of the same reservation.
+    if ((res.status === 201 || res.status === 200) && res.body && res.body.reservation_id && res.body.status === 'confirmed') {
       confirmedReservations.set(res.body.reservation_id, res.body.seats);
     }
   }
@@ -271,14 +283,14 @@ async function main() {
     );
     for (const { seat, userIdx, r } of results) {
       noteReserveResult(r);
-      if (r.status === 201) {
-        hotWinners[seat] = hotWinners[seat] || [];
-        hotWinners[seat].push(userIdx);
+      if ((r.status === 201 || r.status === 200) && r.body && r.body.reservation_id) {
+        hotWinners[seat] = hotWinners[seat] || new Set();
+        hotWinners[seat].add(r.body.reservation_id); // distinct reservations, not responses
       }
     }
     for (const seat of hotSeats) {
-      const winners = hotWinners[seat] || [];
-      check(`hot seat ${seat} has exactly one winner`, winners.length === 1, `winners=${winners.length}`);
+      const winners = hotWinners[seat] || new Set();
+      check(`hot seat ${seat} has exactly one winner`, winners.size === 1, `winners=${winners.size}`);
     }
   }
 
@@ -439,7 +451,7 @@ async function main() {
     for (const s of seats) expectedConfirmedSeats.add(s);
   }
   check(
-    'confirmed seat count matches distinct 201\'d seats minus cancelled seats',
+    'confirmed seat count matches distinct won seats (201 or replayed) minus cancelled seats',
     counts.confirmed === expectedConfirmedSeats.size,
     `actual=${counts.confirmed} expected=${expectedConfirmedSeats.size}`
   );
@@ -483,11 +495,11 @@ async function main() {
   for (const [k, n] of Object.entries(globalStats.serverErrorsByOrigin)) {
     console.log(`      ${k.padEnd(26)}: ${n}`);
   }
-  console.log(`  network errors/timeouts       : ${globalStats.networkErrors}`);
+  console.log(`  network errors/timeouts       : ${globalStats.networkErrors}  (timeouts retried with same key: ${timeoutRetries})`);
   console.log(`latency p50/p95/p99/max (ms)     : ${p50}/${p95}/${p99}/${max}`);
   console.log('\nhot seat winners:');
   for (const seat of hotSeats) {
-    console.log(`  ${seat}: ${(hotWinners[seat] || []).length} winner(s)`);
+    console.log(`  ${seat}: ${(hotWinners[seat] || new Set()).size} winner(s)`);
   }
 
   console.log('\n=== CHECKS ===');
